@@ -52,7 +52,7 @@ def formats(first, last, domain):
     # Check if we have a pattern cache for this domain
     if domain in pattern_cache and pattern_cache[domain]:
         pattern = pattern_cache[domain]
-        # logging.debug(f"Using cached pattern {pattern} for {domain}")
+        logging.debug(f"Using cached pattern {pattern} for {domain}")
         
         # Apply the known pattern
         if pattern == "first.last":
@@ -91,7 +91,7 @@ def verify_domain(domain):
         # Check MX records
         records = dns.resolver.resolve(domain, 'MX')
         if not records:
-            # logging.warning(f"No MX records found for {domain}")
+            logging.warning(f"No MX records found for {domain}")
             domain_cache[domain] = False
             return False
             
@@ -119,7 +119,7 @@ def verify_domain(domain):
         return True
     
     except Exception as e:
-        # logging.warning(f"Domain verification failed for {domain}: {str(e)}")
+        logging.warning(f"Domain verification failed for {domain}: {str(e)}")
         domain_cache[domain] = False
         return False
 
@@ -175,11 +175,11 @@ def verify_email_smtp(email, domain):
                 
             return True
         else:
-            # logging.debug(f"Email {email} rejected: {message}")
+            logging.debug(f"Email {email} rejected: {message}")
             return False
             
     except Exception as e:
-        # logging.debug(f"SMTP verification failed for {email}: {str(e)}")
+        logging.debug(f"SMTP verification failed for {email}: {str(e)}")
         return False
 
 def extract_domain_from_company(company_name):
@@ -208,7 +208,7 @@ def extract_domain_from_company(company_name):
             return domain
     
     # No working domain found
-    # logging.warning(f"No working domain found for {company_name}")
+    logging.warning(f"No working domain found for {company_name}")
     return f"{company}.com"  # Default to .com if no working domain found
 
 def extract_domain_from_linkedin_url(url):
@@ -235,7 +235,7 @@ def extract_domain_from_linkedin_url(url):
                 
         return None
     except Exception as e:
-        # logging.error(f"Error extracting domain from LinkedIn URL: {str(e)}")
+        logging.error(f"Error extracting domain from LinkedIn URL: {str(e)}")
         return None
 
 def get_company_info_from_linkedin_data(row):
@@ -272,7 +272,7 @@ def verify_emails(email_list, domain):
     
     # First check if domain is valid
     if not verify_domain(domain):
-        # logging.warning(f"Domain {domain} is not valid for email")
+        logging.warning(f"Domain {domain} is not valid for email")
         return valid_emails
     
     # Try each email
@@ -327,18 +327,18 @@ def process_row(row_data):
         # First try domain from LinkedIn URL extraction
         if company_info['domain']:
             domain = company_info['domain']
-            # logging.info(f"Using domain from LinkedIn URL: {domain}")
+            logging.info(f"Using domain from LinkedIn URL: {domain}")
         
         # If no domain yet, try LinkedIn company URL if available
         if not domain and 'linkedin' in row and row['linkedin'] and not pd.isna(row['linkedin']):
             domain = extract_domain_from_linkedin_url(row['linkedin'])
             if domain:
-                # logging.info(f"Extracted domain from LinkedIn URL: {domain}")
+                logging.info(f"Extracted domain from LinkedIn URL: {domain}")
         
         # If still no domain, extract from company name
         if not domain and company_name:
             domain = extract_domain_from_company(company_name)
-            # logging.info(f"Extracted domain from company name: {domain}")
+            logging.info(f"Extracted domain from company name: {domain}")
         
         if not domain:
             return i, result
