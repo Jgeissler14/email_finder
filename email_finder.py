@@ -1,416 +1,459 @@
-#!/usr/bin/env python3
-
-# Email finder using Python for LinkedIn data CSV format
-# Modified to only output verified emails with minimal data
-
 import re
-import sys
-import socket
-import smtplib
-import pandas as pd
 import dns.resolver
-import logging
-import time
+import smtplib
+import socket
+import requests
 import random
-from email.utils import parseaddr
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import json
+import time
+import pandas as pd
+from typing import List, Dict, Optional
+from pathlib import Path
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+import multiprocessing as mp
+from functools import partial
 
-# Set up logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("email_finder.log"),
-        logging.StreamHandler()
-    ]
-)
+class EmailFinder:
+    def __init__(self):
+        # Set up logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Email pattern templates
+        self.email_patterns = [
+            "{first}.{last}", "{first}{last}", "{f}{last}", 
+            "{first}", "{first}{initial}", "{initial}{last}",
+            "{first}_{last}", "{first}-{last}"
+        ]
+        
+        # Configure DNS resolver
+        self.resolver = dns.resolver.Resolver()
+        self.resolver.nameservers = ['8.8.8.8', '8.8.4.4']  # Google DNS servers
+        
+        # Configure requests session with retries
+        self.session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        self.session.mount('http://', HTTPAdapter(max_retries=retries))
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# Cache for domain verification results
-domain_cache = {}
-# Cache for known good/bad email patterns by domain
-pattern_cache = {}
-# Rate limiting parameters
-last_request_time = {}
-min_request_interval = 2  # seconds between requests to same domain
+    def generate_email_variations(self, first_name: str, last_name: str, domain: str) -> List[str]:
+        """
+        Generate potential email variations
+        
+        Args:
+            first_name (str): First name
+            last_name (str): Last name
+            domain (str): Company domain
+        
+        Returns:
+            List of potential email addresses
+        """
+        # Normalize inputs
+        first = first_name.lower().replace(' ', '')
+        last = last_name.lower().replace(' ', '')
+        initial = first[0]
+        
+        # Clean domain to prevent duplicates
+        clean_domain = domain.lower().replace('www.', '')
+        if clean_domain.endswith('.com.com'):
+            clean_domain = clean_domain[:-4]  # Remove the extra .com
+        
+        # Generate variations
+        emails = []
+        for pattern in self.email_patterns:
+            email = pattern.format(
+                first=first, 
+                last=last, 
+                f=first[0], 
+                initial=initial
+            )
+            emails.append(f"{email}@{clean_domain}")
+        
+        return list(set(emails))  # Remove duplicates
 
-def formats(first, last, domain):
-    """Create a list of possible email formats."""
-    email_list = []
-
-    # Convert names to lowercase for email generation
-    first = first.lower().strip()
-    last = last.lower().strip()
-    
-    # Remove accents and special characters
-    first = re.sub(r'[^a-z0-9]', '', first)
-    last = re.sub(r'[^a-z0-9]', '', last)
-    
-    # Skip if names are empty after cleaning
-    if not first or not last:
-        return email_list
-    
-    # Check if we have a pattern cache for this domain
-    if domain in pattern_cache and pattern_cache[domain]:
-        pattern = pattern_cache[domain]
-        logging.debug(f"Using cached pattern {pattern} for {domain}")
+    def verify_email_mx(self, email: str) -> bool:
+        """
+        Verify email by checking MX records
         
-        # Apply the known pattern
-        if pattern == "first.last":
-            email_list.append(f"{first}.{last}@{domain}")
-        elif pattern == "flast":
-            email_list.append(f"{first[0]}{last}@{domain}")
-        elif pattern == "firstlast":
-            email_list.append(f"{first}{last}@{domain}")
-        elif pattern == "f.last":
-            email_list.append(f"{first[0]}.{last}@{domain}")
-        elif pattern == "first":
-            email_list.append(f"{first}@{domain}")
-        return email_list
-    
-    # Ordered by likelihood based on common business email patterns
-    email_list = [
-        f"{first}.{last}@{domain}",       # first.last@example.com
-        f"{first[0]}{last}@{domain}",      # flast@example.com
-        f"{first}{last}@{domain}",         # firstlast@example.com
-        f"{first[0]}.{last}@{domain}",     # f.last@example.com
-        f"{first}@{domain}",               # first@example.com
-        f"{last}.{first}@{domain}",        # last.first@example.com
-        f"{last}{first[0]}@{domain}",      # lastf@example.com
-        f"{first}-{last}@{domain}",        # first-last@example.com
-        f"{first}_{last}@{domain}"         # first_last@example.com
-    ]
-    
-    return email_list
-
-def verify_domain(domain):
-    """Check if a domain has valid MX records and can receive email."""
-    if domain in domain_cache:
-        return domain_cache[domain]
-    
-    try:
-        # Check MX records
-        records = dns.resolver.resolve(domain, 'MX')
-        if not records:
-            logging.warning(f"No MX records found for {domain}")
-            domain_cache[domain] = False
-            return False
-            
-        # Try connecting to the mail server
-        mx_record = str(records[0].exchange)
-        smtp_server = mx_record.rstrip('.')
+        Args:
+            email (str): Email address to verify
         
-        # Rate limiting
-        if smtp_server in last_request_time:
-            elapsed = time.time() - last_request_time[smtp_server]
-            if elapsed < min_request_interval:
-                time.sleep(min_request_interval - elapsed + random.uniform(0.1, 1.0))
-        
-        server = smtplib.SMTP(timeout=10)
-        server.set_debuglevel(0)
-        server.connect(smtp_server)
-        server.helo('example.com')
-        server.quit()
-        
-        # Update last request time
-        last_request_time[smtp_server] = time.time()
-        
-        logging.info(f"Domain {domain} has valid mail server: {smtp_server}")
-        domain_cache[domain] = True
-        return True
-    
-    except Exception as e:
-        logging.warning(f"Domain verification failed for {domain}: {str(e)}")
-        domain_cache[domain] = False
-        return False
-
-def verify_email_smtp(email, domain):
-    """Check if an email address exists via SMTP."""
-    try:
-        # Parse email to ensure proper format
-        parsed = parseaddr(email)[1]
-        if not parsed:
-            return False
-            
-        # Get MX records
-        records = dns.resolver.resolve(domain, 'MX')
-        mx_record = str(records[0].exchange)
-        smtp_server = mx_record.rstrip('.')
-        
-        # Rate limiting
-        if smtp_server in last_request_time:
-            elapsed = time.time() - last_request_time[smtp_server]
-            if elapsed < min_request_interval:
-                time.sleep(min_request_interval - elapsed + random.uniform(0.1, 1.0))
-        
-        # Connect to the SMTP server
-        server = smtplib.SMTP(timeout=10)
-        server.set_debuglevel(0)
-        server.connect(smtp_server)
-        server.helo('example.com')
-        
-        # Try RCPT TO command with a fake sender
-        server.mail('verification@example.com')
-        code, message = server.rcpt(email)
-        server.quit()
-        
-        # Update last request time
-        last_request_time[smtp_server] = time.time()
-        
-        # Check if RCPT TO was accepted
-        if code == 250:
-            logging.info(f"Email {email} verified via RCPT TO.")
-            
-            # Record the pattern for this domain
-            name_parts = email.split('@')[0]
-            if '.' in name_parts:
-                pattern_cache[domain] = "first.last"
-            elif '_' in name_parts:
-                pattern_cache[domain] = "first_last"
-            elif '-' in name_parts:
-                pattern_cache[domain] = "first-last"
-            elif len(name_parts) <= 6:  # Rough heuristic for first initial + last name
-                pattern_cache[domain] = "flast"
-            else:
-                pattern_cache[domain] = "firstlast"
-                
+        Returns:
+            bool: Whether email domain has valid MX records
+        """
+        domain = email.split('@')[-1]
+        try:
+            dns.resolver.resolve(domain, 'MX')
             return True
-        else:
-            logging.debug(f"Email {email} rejected: {message}")
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            return False
+
+    def verify_email_smtp(self, email: str, timeout: float = 5.0) -> bool:
+        """
+        Verify email using strict SMTP verification
+        
+        Args:
+            email (str): Email address to verify
+            timeout (float): Connection timeout
+        
+        Returns:
+            bool: Whether email appears to be valid
+        """
+        domain = email.split('@')[-1]
+        
+        # Skip common domains
+        common_domains = {'google.com', 'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'medium.com'}
+        if domain.lower() in common_domains:
             return False
             
-    except Exception as e:
-        logging.debug(f"SMTP verification failed for {email}: {str(e)}")
-        return False
+        try:
+            # Get MX record
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            mx_record = str(mx_records[0].exchange)
 
-def extract_domain_from_company(company_name):
-    """Extract a potential domain from company name."""
-    if not company_name or pd.isna(company_name) or company_name.lower() == 'nan':
-        return None
-        
-    # Remove non-alphanumeric chars except spaces
-    company = re.sub(r'[^\w\s]', '', company_name.lower())
-    # Replace spaces with empty string
-    company = re.sub(r'\s+', '', company)
-    
-    # Try common TLDs
-    domains = [
-        f"{company}.com",
-        f"{company}.io",
-        f"{company}.co",
-        f"{company}.net",
-        f"{company}.org"
-    ]
-    
-    # Try each domain
-    for domain in domains:
-        if verify_domain(domain):
-            logging.info(f"Found working domain {domain} for {company_name}")
-            return domain
-    
-    # No working domain found
-    logging.warning(f"No working domain found for {company_name}")
-    return f"{company}.com"  # Default to .com if no working domain found
-
-def extract_domain_from_linkedin_url(url):
-    """Extract domain from LinkedIn profile or company URL."""
-    if not url or pd.isna(url) or url.lower() == 'nan':
-        return None
-        
-    try:
-        # Try to extract company domain from LinkedIn company URL
-        company_url_match = re.search(r'linkedin\.com/company/([^/]+)', url)
-        if company_url_match:
-            company_slug = company_url_match.group(1)
-            # Convert slug to potential domain
-            domain = re.sub(r'[^\w]', '', company_slug.lower()) + ".com"
-            if verify_domain(domain):
-                return domain
-            
-        # Try to extract email domain from profile URL if present
-        email_match = re.search(r'[\w\.-]+@([\w\.-]+)', url)
-        if email_match:
-            domain = email_match.group(1)
-            if verify_domain(domain):
-                return domain
+            # Attempt SMTP connection
+            with smtplib.SMTP(mx_record, 25, timeout=timeout) as smtp:
+                smtp.ehlo()
+                smtp.mail('')
+                code, message = smtp.rcpt(str(email))
                 
-        return None
-    except Exception as e:
-        logging.error(f"Error extracting domain from LinkedIn URL: {str(e)}")
-        return None
+                # Log the response for debugging
+                self.logger.debug(f"SMTP response for {email}: {code} - {message}")
+                
+                # Only accept code 250 (success)
+                if code == 250:
+                    self.logger.info(f"Found valid email: {email}")
+                    return True
+                # Reject all other codes
+                return False
+                    
+        except Exception as e:
+            self.logger.debug(f"SMTP verification failed for {email}: {e}")
+            return False
 
-def get_company_info_from_linkedin_data(row):
-    """Extract company information from LinkedIn data fields."""
-    company_info = {
-        'name': None,
-        'domain': None,
-        'industry': None
-    }
-    
-    # Try to get company name from different possible fields
-    if 'company_name' in row and row['company_name'] and not pd.isna(row['company_name']):
-        company_info['name'] = row['company_name']
-    elif 'linkedin_company' in row and row['linkedin_company'] and not pd.isna(row['linkedin_company']):
-        company_info['name'] = row['linkedin_company']
-    elif 'current_positions/0/companyName' in row and row['current_positions/0/companyName'] and not pd.isna(row['current_positions/0/companyName']):
-        company_info['name'] = row['current_positions/0/companyName']
-    
-    # Try to extract industry if available
-    if 'current_positions/0/companyUrnResolutionResult/industry' in row and row['current_positions/0/companyUrnResolutionResult/industry'] and not pd.isna(row['current_positions/0/companyUrnResolutionResult/industry']):
-        company_info['industry'] = row['current_positions/0/companyUrnResolutionResult/industry']
-    
-    # Try to get company domain from LinkedIn URL if available
-    if 'linkedin' in row and row['linkedin'] and not pd.isna(row['linkedin']):
-        domain = extract_domain_from_linkedin_url(row['linkedin'])
-        if domain:
-            company_info['domain'] = domain
-    
-    return company_info
-
-def verify_emails(email_list, domain):
-    """Verify a list of email addresses and return valid ones."""
-    valid_emails = []
-    
-    # First check if domain is valid
-    if not verify_domain(domain):
-        logging.warning(f"Domain {domain} is not valid for email")
-        return valid_emails
-    
-    # Try each email
-    for email in email_list:
-        if verify_email_smtp(email, domain):
-            valid_emails.append(email)
-            # We found one valid email, can stop checking more formats
-            break
-    
-    return valid_emails
-
-def process_row(row_data):
-    """Process a single row from the dataframe."""
-    i, row = row_data
-    result = {
-        'first_name': '',
-        'last_name': '',
-        'company_name': '',
-        'email': '',
-        'is_verified': False
-    }
-    
-    try:
-        # Extract person data
-        first_name = str(row.get('first_name', ''))
-        if pd.isna(first_name) or first_name.lower() == 'nan':
-            first_name = ''
+    def find_company_domain(self, company_name: str) -> Optional[str]:
+        """
+        Find company domain through multiple methods
+        
+        Args:
+            company_name (str): Company name
+        
+        Returns:
+            Extracted domain or None
+        """
+        # Try direct domain lookup first
+        domain = self._try_direct_domain_lookup(company_name)
+        if domain and self._is_valid_company_domain(domain, company_name):
+            return domain
             
-        last_name = str(row.get('last_name', ''))
-        if pd.isna(last_name) or last_name.lower() == 'nan':
-            last_name = ''
+        # Try Google search as fallback
+        domain = self._try_google_search(company_name)
+        if domain and self._is_valid_company_domain(domain, company_name):
+            return domain
             
-        # Get company information from LinkedIn data
-        company_info = get_company_info_from_linkedin_data(row)
-        company_name = company_info['name']
+        return None
+    
+    def _try_direct_domain_lookup(self, company_name: str) -> Optional[str]:
+        """
+        Try to find domain by direct lookup
         
-        # Store basic info
-        result['first_name'] = first_name
-        result['last_name'] = last_name
-        result['company_name'] = company_name if company_name else ''
+        Args:
+            company_name (str): Company name
         
-        logging.info(f"Processing row {i+1}: {first_name} {last_name} at {company_name}")
+        Returns:
+            Extracted domain or None
+        """
+        try:
+            # Clean company name
+            clean_name = company_name.lower().replace(' ', '')
+            
+            # Common domain extensions
+            extensions = ['.com', '.org', '.net', '.io', '.co']
+            
+            for ext in extensions:
+                domain = f"{clean_name}{ext}"
+                try:
+                    # Try to resolve the domain
+                    self.resolver.resolve(domain, 'A')
+                    return domain
+                except dns.resolver.NXDOMAIN:
+                    continue
+                except Exception as e:
+                    self.logger.debug(f"DNS lookup failed for {domain}: {e}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Direct domain lookup failed: {e}")
+            return None
+    
+    def _try_google_search(self, company_name: str) -> Optional[str]:
+        """
+        Try to find domain through Google search
         
-        # Skip if missing required data
-        if not first_name or not last_name or not company_name:
-            logging.warning(f"Row {i+1}: Missing required data, skipping")
-            return i, result
+        Args:
+            company_name (str): Company name
         
-        # Try to get domain
-        domain = None
+        Returns:
+            Extracted domain or None
+        """
+        try:
+            # Prepare search query
+            query = f"site:linkedin.com {company_name} official website"
+            
+            # Headers to mimic browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            # Perform search with configured session
+            response = self.session.get(
+                f"https://www.google.com/search?q={query}", 
+                headers=headers,
+                timeout=10
+            )
+            
+            # Extract domain using regex
+            domain_match = re.search(r'https?://(?:www\.)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,})', response.text)
+            
+            return domain_match.group(1) if domain_match else None
         
-        # First try domain from LinkedIn URL extraction
-        if company_info['domain']:
-            domain = company_info['domain']
-            logging.info(f"Using domain from LinkedIn URL: {domain}")
+        except Exception as e:
+            self.logger.warning(f"Google search failed: {e}")
+            return None
+
+    def _is_valid_company_domain(self, domain: str, company_name: str) -> bool:
+        """
+        Check if domain is valid for the company
         
-        # If no domain yet, try LinkedIn company URL if available
-        if not domain and 'linkedin' in row and row['linkedin'] and not pd.isna(row['linkedin']):
-            domain = extract_domain_from_linkedin_url(row['linkedin'])
-            if domain:
-                logging.info(f"Extracted domain from LinkedIn URL: {domain}")
+        Args:
+            domain (str): Domain to check
+            company_name (str): Company name
         
-        # If still no domain, extract from company name
-        if not domain and company_name:
-            domain = extract_domain_from_company(company_name)
-            logging.info(f"Extracted domain from company name: {domain}")
+        Returns:
+            bool: Whether domain is valid
+        """
+        # Skip common domains
+        common_domains = {'google.com', 'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'medium.com'}
+        if domain.lower() in common_domains:
+            return False
+            
+        # Clean company name for comparison
+        clean_company = company_name.lower().replace(' ', '')
+        clean_domain = domain.lower().replace('www.', '')
         
+        # Remove any duplicate domain extensions
+        if clean_domain.endswith('.com.com'):
+            clean_domain = clean_domain[:-4]  # Remove the extra .com
+            
+        # Check if company name is part of domain
+        return clean_company in clean_domain
+
+    def comprehensive_email_search(self, name: str, company: str) -> Dict:
+        """
+        Comprehensive email finding and verification process
+        
+        Args:
+            name (str): Full name
+            company (str): Company name
+        
+        Returns:
+            Comprehensive email search results
+        """
+        # Split name
+        try:
+            first_name, last_name = name.split(' ', 1)
+        except ValueError:
+            return {'error': 'Invalid name format. Please provide first and last name.'}
+        
+        # Find company domain
+        domain = self.find_company_domain(company)
         if not domain:
-            return i, result
-            
-        # Generate email formats
-        email_list = formats(first_name, last_name, domain)
+            return {'error': 'Could not determine company domain'}
         
-        # Verify emails
-        valid_emails = verify_emails(email_list, domain)
+        # Generate potential emails
+        potential_emails = self.generate_email_variations(first_name, last_name, domain)
         
-        # Update results
+        # Log the potential emails being checked
+        self.logger.info(f"Checking potential emails for {name} at {company}: {', '.join(potential_emails)}")
+        
+        # Try the most common format first (first.last@domain)
+        preferred_email = f"{first_name.lower()}.{last_name.lower()}@{domain}"
+        if preferred_email in potential_emails:
+            mx_verified = self.verify_email_mx(preferred_email)
+            if mx_verified:
+                time.sleep(1)  # Delay between MX and SMTP checks
+                if self.verify_email_smtp(preferred_email):
+                    self.logger.info(f"Found valid email: {preferred_email}")
+                    return {
+                        'domain': domain,
+                        'valid_emails': [preferred_email]
+                    }
+        
+        # If preferred format fails, try other formats
+        verified_emails = {}
+        valid_emails = []
+        
+        for email in potential_emails:
+            if email == preferred_email:  # Skip the preferred email as we already checked it
+                continue
+                
+            mx_verified = self.verify_email_mx(email)
+            if mx_verified:
+                time.sleep(1)  # Delay between MX and SMTP checks
+                if self.verify_email_smtp(email):
+                    valid_emails.append(email)
+        
         if valid_emails:
-            chosen_email = valid_emails[0]
-            logging.info(f"Found valid email: {chosen_email}")
-            result['email'] = chosen_email
-            result['is_verified'] = True
-            
-    except Exception as e:
-        logging.error(f"Error processing row {i+1}: {str(e)}", exc_info=True)
-    
-    return i, result
+            # Only return the first valid email found
+            self.logger.info(f"Found valid email: {valid_emails[0]}")
+            return {
+                'domain': domain,
+                'valid_emails': [valid_emails[0]]
+            }
+        else:
+            self.logger.info(f"No valid emails found for {name} at {company}")
+            return {
+                'domain': domain,
+                'valid_emails': []
+            }
 
-def process_csv(input_file, threads=4):
-    """Process CSV file and find emails for each contact."""
-    try:
-        # Read the CSV
-        logging.info(f"Reading CSV file: {input_file}")
-        df = pd.read_csv(input_file)
-        logging.info(f"Loaded CSV with {len(df)} rows and columns: {len(df.columns)} columns")
-        
-        # Process rows in parallel
-        all_results = []
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            for i, result in executor.map(process_row, [(i, row) for i, row in df.iterrows()]):
-                all_results.append(result)
-        
-        # Create dataframe with verified emails only
-        verified_results = [r for r in all_results if r['is_verified']]
-        
-        if not verified_results:
-            logging.info("No verified emails found")
-            return
+def process_chunk(chunk_data: pd.DataFrame, finder: EmailFinder, output_file: Path) -> None:
+    """
+    Process a chunk of data in parallel
+    
+    Args:
+        chunk_data (pd.DataFrame): Chunk of data to process
+        finder (EmailFinder): EmailFinder instance
+        output_file (Path): Path to output CSV file
+    """
+    for _, row in chunk_data.iterrows():
+        try:
+            # Extract name and company from correct columns
+            first_name = row['first_name']
+            last_name = row['last_name']
+            company = row['current_positions/0/companyName']
             
-        verified_df = pd.DataFrame(verified_results)
-        verified_df = verified_df[['first_name', 'last_name', 'company_name', 'email']]
+            # Skip if missing required data
+            if pd.isna(first_name) or pd.isna(last_name) or pd.isna(company):
+                continue
+            
+            # Find email
+            result = finder.comprehensive_email_search(
+                name=f"{first_name} {last_name}",
+                company=company
+            )
+            
+            # Get the most likely email (prefer first.last@domain format)
+            email = None
+            if result.get('valid_emails'):
+                # Try to find first.last format first
+                preferred_email = f"{first_name.lower()}.{last_name.lower()}@{result['domain']}"
+                if preferred_email in result['valid_emails']:
+                    email = preferred_email
+                else:
+                    # If preferred format not found, use the first valid email
+                    email = result['valid_emails'][0]
+            
+            # Write to CSV with lock to prevent concurrent writes
+            if email:
+                with mp.Lock():
+                    with open(output_file, 'a', newline='') as f:
+                        f.write(f"{first_name},{last_name},{company},{email},{row.get('file', 'unknown')}\n")
+            
+            # Add small delay to avoid rate limits
+            time.sleep(1)
+            
+        except Exception as e:
+            logging.error(f"Error processing row for {first_name} {last_name}: {str(e)}")
+            continue
+
+def main():
+    # Initialize finder
+    finder = EmailFinder()
+    
+    # Setup directories
+    input_dir = Path('input')  # Fixed from 'continue' to 'input'
+    output_dir = Path('output')
+    output_dir.mkdir(exist_ok=True)
+    
+    # Log directory paths
+    logging.info(f"Looking for CSV files in: {input_dir.absolute()}")
+    logging.info(f"Output directory: {output_dir.absolute()}")
+    
+    # Check if input directory exists and has CSV files
+    if not input_dir.exists():
+        logging.error(f"Input directory does not exist: {input_dir.absolute()}")
+        return
         
-        # Save results to CSV
-        output_file = input_file.replace('.csv', '_verified_emails.csv')
-        if output_file == input_file:
-            output_file = "verified_emails_" + input_file
+    csv_files = list(input_dir.glob('*.csv'))
+    if not csv_files:
+        logging.error(f"No CSV files found in {input_dir.absolute()}")
+        return
         
-        logging.info(f"Saving {len(verified_df)} verified emails to {output_file}")
-        verified_df.to_csv(output_file, index=False)
-        
-        # Also output to console
-        print("\nVerified Emails:\n")
-        print(verified_df.to_string(index=False))
-        print(f"\nTotal verified emails found: {len(verified_df)}")
-        
-    except Exception as e:
-        logging.error(f"Error processing CSV: {e}", exc_info=True)
+    logging.info(f"Found {len(csv_files)} CSV files to process")
+    
+    # Set to None to process all rows, or a number to limit rows (e.g., 25)
+    ROW_LIMIT = None  # Change to 25 to test with fewer rows
+    
+    # Create output CSV with headers
+    output_file = output_dir / "email_results.csv"
+    with open(output_file, 'w', newline='') as f:
+        f.write("firstname,lastname,company,email,file\n")
+    
+    # Set up multiprocessing pool with 4 CPUs
+    num_processes = 4
+    logging.info(f"Starting multiprocessing pool with {num_processes} processes")
+    pool = mp.Pool(processes=num_processes)
+    
+    # Process all CSV files in input directory
+    for csv_file in csv_files:
+        try:
+            logging.info(f"Processing file: {csv_file.name}")
+            # Read CSV file
+            df = pd.read_csv(csv_file)
+            logging.info(f"Read {len(df)} rows from {csv_file.name}")
+            
+            # Limit rows if specified
+            if ROW_LIMIT is not None:
+                df = df.head(ROW_LIMIT)
+                logging.info(f"Limited to first {ROW_LIMIT} rows")
+            
+            # Add file name to each row
+            df['file'] = csv_file.name
+            
+            # Split DataFrame into chunks for parallel processing
+            chunk_size = len(df) // num_processes
+            if chunk_size == 0:
+                chunk_size = 1
+            chunks = [df[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+            logging.info(f"Split into {len(chunks)} chunks of size {chunk_size}")
+            
+            # Process chunks in parallel
+            process_chunk_partial = partial(process_chunk, finder=finder, output_file=output_file)
+            pool.map(process_chunk_partial, chunks)
+            
+            logging.info(f"Completed processing {csv_file.name}")
+            
+        except Exception as e:
+            logging.error(f"Error processing file {csv_file.name}: {str(e)}")
+            continue
+    
+    # Close the pool
+    logging.info("Closing multiprocessing pool")
+    pool.close()
+    pool.join()
+    logging.info("Processing complete")
 
 if __name__ == "__main__":
-    logging.info("===== Verified Email Finder Script Started =====")
-    
-    # Get input file from command line or use default
-    input_file = "software-11-50-page1.csv"
-    if len(sys.argv) > 1:
-        input_file = sys.argv[1]
-    
-    # Get number of threads from command line or use default
-    threads = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-    
-    process_csv(input_file, threads)
-    logging.info("===== Verified Email Finder Script Completed =====")
+    main()
